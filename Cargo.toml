@@ -7,7 +7,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.61"
+aws-config = "0.47.0"
+aws-sdk-dynamodb = "0.17.0"
+aws-sdk-s3 = "0.17.0"
+aws-types = "0.47.0"
 clap = {version = "3.2.16", features = ["derive"]}
 crossterm = "0.25.0"
+http = "0.2.8"
 tokio ={version =  "1.20.1", features = ["full"] }
 tui = "0.18.0"
