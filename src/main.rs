@@ -42,7 +42,10 @@ enum SubCmd {
 
 #[derive(Debug, Args)]
 struct QueryDynamoArgs {
+    #[clap(long)]
     query: Option<String>,
+    #[clap(long = "table-name")]
+    table_name: String,
 }
 
 #[tokio::main]
@@ -61,14 +64,23 @@ async fn main() -> Result<()> {
 async fn run(args: &Cli) -> Result<()> {
     match &args.subcmd {
         Some(SubCmd::UI) => run_ui(args.endpoint.as_deref()).await?,
-        Some(SubCmd::QueryDynamo(args)) => query(args).await?,
+        Some(SubCmd::QueryDynamo(a)) => query(a, args.endpoint.as_deref()).await?,
         None => {}
     }
     Ok(())
 }
 
-async fn query(args: &QueryDynamoArgs) -> Result<()> {
-    println!("Querying dymamo: {:?}", args.query);
+async fn query(args: &QueryDynamoArgs, endpoint: Option<&str>) -> Result<()> {
+    println!("Querying dymamo: {:?}", args.table_name);
+    let ep = endpoint.unwrap_or("").to_string();
+    let client = DynamoClient::new(&ep).await;
+    let output = client
+        .client()
+        .scan()
+        .table_name(&args.table_name)
+        .send()
+        .await?;
+    println!("{:#?}", output);
     Ok(())
 }
 
@@ -126,7 +138,10 @@ async fn run_ui(endpoint: Option<&str>) -> Result<()> {
                         let _ = app.move_up();
                     },
                     KeyCode::Enter => {
-                        let _ = app.table_selected().await?;
+                        app.table_selected().await?;
+                    },
+                    KeyCode::Tab => {
+                        let _ = app.toggle_active_pane();
                     },
                         _ => {}
 
@@ -170,12 +185,15 @@ impl App {
         let mut table_list_state = ListState::default();
         table_list_state.select(Some(0));
 
+        let mut table_data_state = TableState::default();
+        table_data_state.select(None);
+
         Self {
             io_tx: Some(io_tx),
             dynamo_client: DynamoClient::new(endpoint).await,
             endpoint: String::new(),
             tables: table_list_state,
-            items: TableState::default(),
+            items: table_data_state,
             table_list: vec![],
             active: ActiveView::TableList,
             selected_table: NebTable::default(),
@@ -197,6 +215,15 @@ impl App {
                     }
                 }
             }
+            ActiveView::TableData => {
+                if let Some(selected) = self.items.selected() {
+                    if selected >= self.selected_table.rows.len() {
+                        self.items.select(Some(1))
+                    } else {
+                        self.items.select(Some(selected + 1))
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -213,6 +240,15 @@ impl App {
                     }
                 }
             }
+            ActiveView::TableData => {
+                if let Some(selected) = self.items.selected() {
+                    if selected > 0 {
+                        self.items.select(Some(selected - 1))
+                    } else {
+                        self.items.select(Some(self.selected_table.rows.len() - 1))
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -222,7 +258,7 @@ impl App {
         if let Some(selected) = self.tables.selected() {
             if selected < self.table_list.len() {
                 let name = &self.table_list[selected];
-                self.dispatch(UIEvent::LoadTable(name.clone())).await;
+                self.dispatch(UIEvent::LoadTable(name.clone())).await?;
             }
         }
         Ok(())
@@ -234,27 +270,33 @@ impl App {
 
     async fn dispatch(&self, action: UIEvent) -> Result<()> {
         if let Some(io_tx) = &self.io_tx {
-            io_tx.send(action).await;
+            let _ = io_tx.send(action).await;
+        }
+
+        Ok(())
+    }
+
+    pub fn toggle_active_pane(&mut self) -> Result<()> {
+        match self.active {
+            ActiveView::TableList => {
+                self.active = ActiveView::TableData;
+                if self.items.selected().is_none() {
+                    self.items.select(Some(0));
+                }
+            }
+            ActiveView::TableData => self.active = ActiveView::TableList,
+            _ => self.active = ActiveView::TableList,
         }
 
         Ok(())
     }
 }
 
-fn refresh_table_list(
-    client: DynamoClient,
-    mut tx: tokio::sync::mpsc::Sender<UIEvent>,
-) -> Result<()> {
+fn refresh_table_list(client: DynamoClient, tx: tokio::sync::mpsc::Sender<UIEvent>) -> Result<()> {
     tokio::spawn(async move {
         match client.client().list_tables().send().await {
             Ok(l) => {
-                let tables: Vec<String> = l
-                    .table_names()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|t| t.clone())
-                    .collect();
-
+                let tables: Vec<String> = l.table_names().unwrap_or_default().to_vec();
                 let _ = tx.send(UIEvent::RefreshDynamoTableList(tables)).await;
             }
             Err(e) => println!("{:?}", e),
@@ -266,6 +308,7 @@ fn refresh_table_list(
 
 #[derive(Debug, Clone)]
 enum ItemValue {
+    Null,
     String(String),
     Number(i64),
     Bool(bool),
@@ -276,6 +319,7 @@ enum ItemValue {
 impl fmt::Display for ItemValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ItemValue::Null => write!(f, "null"),
             ItemValue::String(s) => write!(f, "{}", s),
             ItemValue::Number(n) => write!(f, "{}", n),
             ItemValue::Bool(b) => write!(f, "{}", b),
@@ -293,6 +337,15 @@ impl From<aws_sdk_dynamodb::model::AttributeValue> for ItemValue {
                 Self::Number(n.parse().unwrap_or_default())
             }
             aws_sdk_dynamodb::model::AttributeValue::S(s) => Self::String(s),
+            aws_sdk_dynamodb::model::AttributeValue::Null(_) => Self::Null,
+            aws_sdk_dynamodb::model::AttributeValue::L(l) => {
+                let v: Vec<Self> = l.into_iter().map(|a| a.into()).collect();
+                Self::List(v)
+            }
+            aws_sdk_dynamodb::model::AttributeValue::M(m) => {
+                let h: HashMap<String, Self> = m.into_iter().map(|(k, v)| (k, v.into())).collect();
+                Self::Map(h)
+            }
             _ => panic!("unexpected attribute value: {:?}", item),
         }
     }
@@ -325,7 +378,7 @@ impl From<HashMap<String, aws_sdk_dynamodb::model::AttributeValue>> for TableRow
 impl From<&HashMap<String, aws_sdk_dynamodb::model::AttributeValue>> for TableRow {
     fn from(item: &HashMap<String, aws_sdk_dynamodb::model::AttributeValue>) -> Self {
         let data = item
-            .into_iter()
+            .iter()
             .map(|(k, v)| KV {
                 key: k.to_string(),
                 value: v.to_owned().into(),
@@ -415,7 +468,11 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
         .map(|t| ListItem::new(vec![Spans::from(Span::from(t.clone()))]))
         .collect();
     let tables = List::new(tables)
-        .block(Block::default().borders(Borders::ALL).title("List"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Dynamo Tables"),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(tables, chunks[0], &mut app.tables);
@@ -424,23 +481,26 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
         .selected_table
         .rows
         .iter()
+        .take(3)
         .map(|r| ListItem::new(vec![Spans::from(Span::from(r.data[0].key.clone()))]))
         .collect();
     let items = List::new(table_items)
         .block(Block::default().borders(Borders::ALL).title("Items"))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-    let normal_style = Style::default().bg(Color::Blue);
+    // let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+    let selected_style = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let normal_style = Style::default();
     let header_cells = app
         .selected_table
         .headers
         .iter()
+        .take(3)
         .map(|h| Cell::from(h.to_string()).style(Style::default().fg(Color::Red)));
     let header = Row::new(header_cells)
         .style(normal_style)
         .height(1)
-        .bottom_margin(1);
+        .bottom_margin(2);
     let rows = app.selected_table.rows.iter().map(|item| {
         let height = item
             .data
@@ -453,8 +513,8 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
         Row::new(cells).height(height as u16).bottom_margin(1)
     });
 
-    let width = if app.selected_table.headers.len() > 0 {
-        f.size().width as usize / app.selected_table.headers.len()
+    let width = if !app.selected_table.headers.is_empty() {
+        20
     } else {
         0
     };
@@ -463,6 +523,7 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
         .selected_table
         .headers
         .iter()
+        .take(3)
         .map(|_h| Constraint::Length(width as u16))
         .collect();
     let t = Table::new(rows)
@@ -470,6 +531,7 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
         .block(Block::default().borders(Borders::ALL).title("Table"))
         .highlight_style(selected_style)
         .highlight_symbol(">> ")
+        .column_spacing(10)
         .widths(&widths);
     f.render_stateful_widget(t, chunks[1], &mut app.items);
 
@@ -511,12 +573,15 @@ impl DynamoClient {
     pub async fn new(endpoint: &str) -> Self {
         // Select a profile by setting the `AWS_PROFILE` environment variable.
         let config = aws_config::load_from_env().await;
-        let uri = endpoint.parse().unwrap();
-        let dynamodb_local_config = aws_sdk_dynamodb::config::Builder::from(&config)
-            .endpoint_resolver(Endpoint::immutable(uri))
-            .build();
+        let mut dynamodb_local_config = aws_sdk_dynamodb::config::Builder::from(&config);
+        if !endpoint.is_empty() {
+            let uri = endpoint.parse().unwrap();
+            dynamodb_local_config =
+                dynamodb_local_config.endpoint_resolver(Endpoint::immutable(uri));
+        }
+        let cfg = dynamodb_local_config.build();
 
-        let client = Client::from_conf(dynamodb_local_config);
+        let client = Client::from_conf(cfg);
 
         Self { client }
     }
