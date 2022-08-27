@@ -6,15 +6,14 @@ use std::{
 
 use anyhow::Result;
 use aws_sdk_dynamodb::{Client, Endpoint};
-use aws_sdk_s3::model::server_side_encryption_configuration;
 use clap::{Args, Parser, Subcommand};
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use http::Uri;
-use tokio::sync::mpsc::{Receiver, Sender};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Sender;
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -23,6 +22,8 @@ use tui::{
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table, TableState},
     Frame, Terminal,
 };
+
+const MAX_CELL_WIDTH: u16 = 60;
 
 #[derive(Debug, Parser)] // requires `derive` feature
 #[clap(name = "nebulous")]
@@ -106,7 +107,7 @@ async fn run_ui(endpoint: Option<&str>) -> Result<()> {
     terminal.clear()?;
 
     // let (ui_tx, ui_rx): (Sender<Event<KeyEvent>>, Receiver<Event<KeyEvent>>) =
-    let (mut ui_tx, mut ui_rx) = tokio::sync::mpsc::channel(1);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel(1);
 
     let ep = endpoint.unwrap_or("").to_string();
     let mut app = App::new(ui_tx.clone(), &ep).await;
@@ -164,14 +165,13 @@ async fn run_ui(endpoint: Option<&str>) -> Result<()> {
 }
 
 enum ActiveView {
-    None,
     TableList,
     TableData,
 }
 
 struct App {
-    dynamo_client: DynamoClient,
-    endpoint: String,
+    // dynamo_client: DynamoClient,
+    // endpoint: String,
     tables: ListState,
     table_list: Vec<String>,
     items: TableState,
@@ -181,7 +181,7 @@ struct App {
 }
 
 impl App {
-    pub async fn new(io_tx: Sender<UIEvent>, endpoint: &str) -> Self {
+    pub async fn new(io_tx: Sender<UIEvent>, _endpoint: &str) -> Self {
         let mut table_list_state = ListState::default();
         table_list_state.select(Some(0));
 
@@ -190,8 +190,8 @@ impl App {
 
         Self {
             io_tx: Some(io_tx),
-            dynamo_client: DynamoClient::new(endpoint).await,
-            endpoint: String::new(),
+            // dynamo_client: DynamoClient::new(endpoint).await,
+            // endpoint: String::new(),
             tables: table_list_state,
             items: table_data_state,
             table_list: vec![],
@@ -224,7 +224,6 @@ impl App {
                     }
                 }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -249,7 +248,6 @@ impl App {
                     }
                 }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -285,7 +283,6 @@ impl App {
                 }
             }
             ActiveView::TableData => self.active = ActiveView::TableList,
-            _ => self.active = ActiveView::TableList,
         }
 
         Ok(())
@@ -306,7 +303,7 @@ fn refresh_table_list(client: DynamoClient, tx: tokio::sync::mpsc::Sender<UIEven
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 enum ItemValue {
     Null,
     String(String),
@@ -323,8 +320,19 @@ impl fmt::Display for ItemValue {
             ItemValue::String(s) => write!(f, "{}", s),
             ItemValue::Number(n) => write!(f, "{}", n),
             ItemValue::Bool(b) => write!(f, "{}", b),
-            ItemValue::Map(_m) => write!(f, "Map..."),
-            ItemValue::List(_l) => write!(f, "List"),
+            ItemValue::Map(m) => {
+                let s = serde_json::to_string(m).unwrap_or_default();
+                write!(f, "{}", s)
+            }
+            ItemValue::List(l) => {
+                let s = serde_json::to_string(l).unwrap_or_default();
+                write!(f, "{}", s)
+                // let _ = write!(f, "[");
+                // let items: Vec<String> = l.iter().map(|i| format!("{}", i)).collect();
+                // let comma_list = items.join(", ");
+                // let _ = write!(f, "{}", comma_list);
+                // write!(f, "]")
+            }
         }
     }
 }
@@ -377,13 +385,14 @@ impl From<HashMap<String, aws_sdk_dynamodb::model::AttributeValue>> for TableRow
 
 impl From<&HashMap<String, aws_sdk_dynamodb::model::AttributeValue>> for TableRow {
     fn from(item: &HashMap<String, aws_sdk_dynamodb::model::AttributeValue>) -> Self {
-        let data = item
+        let mut data: Vec<KV> = item
             .iter()
             .map(|(k, v)| KV {
                 key: k.to_string(),
                 value: v.to_owned().into(),
             })
             .collect();
+        data.sort_by(|a, b| a.key.cmp(&b.key));
         Self { data }
     }
 }
@@ -403,7 +412,7 @@ impl NebTable {
 async fn load_table(
     endpoint: &str,
     table_name: &str,
-    mut tx: tokio::sync::mpsc::Sender<UIEvent>,
+    tx: tokio::sync::mpsc::Sender<UIEvent>,
 ) -> Result<()> {
     let client = DynamoClient::new(endpoint).await;
 
@@ -416,13 +425,15 @@ async fn load_table(
         .await?;
 
     if let Some(items) = items.items() {
-        let headers = if let Some(first) = items.first() {
+        let mut headers = if let Some(first) = items.first() {
             first.iter().map(|(k, _)| k.clone()).collect()
         } else {
             vec![]
         };
 
-        let vals: Vec<TableRow> = items.into_iter().map(|i| i.into()).collect();
+        headers.sort();
+
+        let vals: Vec<TableRow> = items.iter().map(|i| i.into()).collect();
         // println!("{:?}", vals);
 
         let table = NebTable::new(headers, vals);
@@ -473,29 +484,40 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
                 .borders(Borders::ALL)
                 .title("Dynamo Tables"),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+        .highlight_style(
+            Style::default()
+                .bg(Color::LightBlue)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_stateful_widget(tables, chunks[0], &mut app.tables);
 
-    let table_items: Vec<ListItem> = app
-        .selected_table
-        .rows
-        .iter()
-        .take(3)
-        .map(|r| ListItem::new(vec![Spans::from(Span::from(r.data[0].key.clone()))]))
-        .collect();
-    let items = List::new(table_items)
-        .block(Block::default().borders(Borders::ALL).title("Items"))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+    // let table_items: Vec<ListItem> = app
+    //     .selected_table
+    //     .rows
+    //     .iter()
+    //     .take(3)
+    //     .map(|r| ListItem::new(vec![Spans::from(Span::from(r.data[0].key.clone()))]))
+    //     .collect();
+    // // let items = List::new(table_items)
+    // //     .block(Block::default().borders(Borders::ALL).title("Items"))
+    // //     .highlight_style(
+    //         Style::default()
+    //             .bg(Color::LightBlue)
+    //             .add_modifier(Modifier::BOLD),
+    //     );
+    // .highlight_symbol("> ");
     // let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-    let selected_style = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let selected_style = Style::default()
+        .bg(Color::LightCyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let normal_style = Style::default();
     let header_cells = app
         .selected_table
         .headers
         .iter()
-        .take(3)
+        .take(4)
         .map(|h| Cell::from(h.to_string()).style(Style::default().fg(Color::Red)));
     let header = Row::new(header_cells)
         .style(normal_style)
@@ -519,18 +541,35 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<()> {
         0
     };
 
+    let cols = app
+        .selected_table
+        .rows
+        .iter()
+        .fold(0, |c, r| c.max(r.data.len()));
+
+    let mut col_widths = vec![0_u16; cols];
+    for row in &app.selected_table.rows {
+        for (i, c) in row.data.iter().enumerate() {
+            col_widths[i] = (c.value.to_string().len() as u16).max(col_widths[i]);
+            if col_widths[i] > MAX_CELL_WIDTH {
+                col_widths[i] = MAX_CELL_WIDTH;
+            }
+        }
+    }
+
     let widths: Vec<Constraint> = app
         .selected_table
         .headers
         .iter()
-        .take(3)
-        .map(|_h| Constraint::Length(width as u16))
+        .enumerate()
+        .take(4)
+        .map(|(i, _h)| Constraint::Length(col_widths[i]))
         .collect();
     let t = Table::new(rows)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title("Table"))
         .highlight_style(selected_style)
-        .highlight_symbol(">> ")
+        // .highlight_symbol(">> ")
         .column_spacing(10)
         .widths(&widths);
     f.render_stateful_widget(t, chunks[1], &mut app.items);
